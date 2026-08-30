@@ -3,6 +3,9 @@
 // the WebSocket factory and timers are injectable so tests never need a
 // network or real clocks.
 
+import { TerminalTabServerFrameSchema, type TerminalRef } from "@matrix-os/contracts";
+import { parseTerminalRefKey } from "./terminal-workspaces";
+
 export const LIVE_TAIL_FROM_SEQ = 9_007_199_254_740_991;
 
 export type ShellSocketState =
@@ -26,8 +29,6 @@ export interface ShellSocketEvents {
   onState(state: ShellSocketState, detail?: { code?: string }): void;
   onOutput(data: string, seq: number): void;
   onCanonicalSize?(size: { cols: number; rows: number }): void;
-  onLeaseRevoked?(): void;
-  onPresentationReset?(): void;
   onGap(): void;
   onExit(code: number): void;
 }
@@ -38,7 +39,6 @@ export interface ShellSocketOptions {
   chatId?: string;
   cwd?: string;
   runtimeSlot: string;
-  clientClass?: "hard" | "soft";
   events: ShellSocketEvents;
   createWebSocket?: (url: string) => WebSocketLike;
   setTimeoutFn?: typeof setTimeout;
@@ -58,11 +58,18 @@ const RESIZE_DEBOUNCE_STARTUP_MS = 220;
 const RESIZE_DEBOUNCE_STEADY_MS = 90;
 const STARTUP_SETTLE_AFTER_ATTACH_MS = 300;
 const RESIZE_FALLBACK_AFTER_ATTACH_MS = 900;
-const LEASE_HEARTBEAT_INTERVAL_MS = 10_000;
-const MIN_COLS = 1;
+const MIN_COLS = 20;
 const MAX_COLS = 500;
-const MIN_ROWS = 1;
+const MIN_ROWS = 5;
+const HEARTBEAT_INTERVAL_MS = 30_000;
 const MAX_ROWS = 200;
+const REPLACEMENT_REPLAY_MAX_FRAMES = 1_024;
+const REPLACEMENT_REPLAY_MAX_CHARS = 5 * 1024 * 1024;
+
+interface RetainedOutput {
+  seq: number;
+  data: string;
+}
 
 // Lesson L5: these codes must never trigger a reconnect loop.
 const FATAL_ERROR_CODES: ReadonlySet<string> = new Set([
@@ -114,8 +121,14 @@ export class ShellSocket {
   private started = false;
   private disposed = false;
   private lastSeqValue = 0;
+  private lastTerminalRevisionValue = 0;
+  private lastWorkspaceRevisionValue = 0;
+  private lastPresentationRevisionValue = 0;
   private receivedOutput = false;
+  private readonly retainedOutput: RetainedOutput[] = [];
+  private retainedOutputChars = 0;
   private attachedSessionName: string | null = null;
+  private readonly terminalRef: TerminalRef;
   private detachPending = false;
   private failedAttempts = 0;
   private pendingInput: string[] = [];
@@ -128,16 +141,13 @@ export class ShellSocket {
   private settleTimer: TimerHandle | null = null;
   private fallbackTimer: TimerHandle | null = null;
   private handshakeTimer: TimerHandle | null = null;
-  private leaseHeartbeatTimer: TimerHandle | null = null;
-  private leaseEpoch: number | null = null;
+  private heartbeatTimer: TimerHandle | null = null;
 
   constructor(options: ShellSocketOptions) {
-    const hasSession = typeof options.sessionName === "string" && options.sessionName.length > 0;
-    const hasCwd = typeof options.cwd === "string" && options.cwd.length > 0;
-    if (hasSession === hasCwd) {
-      throw new Error("ShellSocket requires exactly one of sessionName or cwd");
-    }
+    const terminalRef = options.sessionName ? parseTerminalRefKey(options.sessionName) : null;
+    if (!terminalRef || options.cwd) throw new Error("ShellSocket requires a terminal workspace/tab reference");
     this.opts = options;
+    this.terminalRef = terminalRef;
     this.createWs = options.createWebSocket ?? defaultCreateWebSocket;
     this.setT = options.setTimeoutFn ?? (globalThis.setTimeout.bind(globalThis) as typeof setTimeout);
     this.clearT =
@@ -168,7 +178,7 @@ export class ShellSocket {
       const chunk = data.slice(offset, end);
       offset = end;
       if (this.currentState === "attached" && this.socket !== null) {
-        this.sendFrame({ type: "input", data: chunk });
+        this.sendFrame({ type: "input", terminalRef: this.terminalRef, data: chunk });
       } else {
         this.pendingInput.push(chunk);
         if (this.pendingInput.length > PENDING_INPUT_MAX_CHUNKS) {
@@ -227,7 +237,10 @@ export class ShellSocket {
     this.lastSentDims = null;
     this.resizeSentSinceAttach = false;
     this.inStartupWindow = true;
-    this.leaseEpoch = null;
+    // Terminal stream and canonical-size frames use different revision
+    // domains. Both are monotonic only within one attachment.
+    this.lastTerminalRevisionValue = 0;
+    this.lastWorkspaceRevisionValue = 0;
 
     const url = this.buildUrl(isReconnect);
     let socket: WebSocketLike;
@@ -278,21 +291,13 @@ export class ShellSocket {
       this.opts.runtimeSlot !== "primary"
         ? `&runtime=${encodeURIComponent(this.opts.runtimeSlot)}`
         : "";
-    const chatSuffix = this.opts.chatId
-      ? `&chat=${encodeURIComponent(this.opts.chatId)}`
-      : "";
-    const sessionName = isReconnect
-      ? (this.attachedSessionName ?? this.opts.sessionName ?? null)
-      : (this.opts.sessionName ?? null);
-    if (sessionName !== null && sessionName.length > 0) {
-      const fromSeq = isReconnect && this.receivedOutput ? this.lastSeqValue + 1 : LIVE_TAIL_FROM_SEQ;
-      const size = this.lastKnownDims;
-      const sizingSuffix = this.opts.clientClass && size
-        ? `&client=${this.opts.clientClass}&cols=${size.cols}&rows=${size.rows}&lease=exclusive`
-        : "";
-      return `${base}/ws/terminal/session?session=${encodeURIComponent(sessionName)}&fromSeq=${fromSeq}${chatSuffix}${runtimeSuffix}${sizingSuffix}`;
-    }
-    return `${base}/ws/terminal?cwd=${encodeURIComponent(this.opts.cwd ?? "")}${runtimeSuffix}`;
+    const chatSuffix = this.opts.chatId ? `&chat=${encodeURIComponent(this.opts.chatId)}` : "";
+    const fromSeq = isReconnect && this.receivedOutput
+      ? Math.min(this.lastSeqValue + 1, LIVE_TAIL_FROM_SEQ)
+      : LIVE_TAIL_FROM_SEQ;
+    const size = this.lastKnownDims;
+    const sizingSuffix = size ? `&cols=${size.cols}&rows=${size.rows}` : "";
+    return `${base}/ws/terminal/tab?workspaceId=${encodeURIComponent(this.terminalRef.workspaceId)}&tabId=${encodeURIComponent(this.terminalRef.tabId)}&client=electron&fromSeq=${fromSeq}${chatSuffix}${runtimeSuffix}${sizingSuffix}`;
   }
 
   private scheduleReconnect(): void {
@@ -344,7 +349,32 @@ export class ShellSocket {
       console.warn("[shell-socket] ignoring non-object websocket frame");
       return;
     }
-    const frame = parsed as Record<string, unknown>;
+    const validated = TerminalTabServerFrameSchema.safeParse(parsed);
+    if (!validated.success) {
+      console.warn("[shell-socket] ignoring invalid terminal frame");
+      return;
+    }
+    const frame = validated.data as unknown as Record<string, unknown>;
+    const frameRef = frame.terminalRef as TerminalRef | undefined;
+    if (frameRef && (
+      frameRef.workspaceId !== this.terminalRef.workspaceId ||
+      frameRef.tabId !== this.terminalRef.tabId
+    )) {
+      console.warn("[shell-socket] ignoring mismatched terminal frame");
+      return;
+    }
+    if (typeof frame.revision === "number") {
+      const workspaceRevision = frame.type === "canonical-size";
+      const lastRevision = workspaceRevision
+        ? this.lastWorkspaceRevisionValue
+        : this.lastTerminalRevisionValue;
+      if (frame.revision < lastRevision) {
+        console.warn("[shell-socket] ignoring stale terminal revision");
+        return;
+      }
+      if (workspaceRevision) this.lastWorkspaceRevisionValue = frame.revision;
+      else this.lastTerminalRevisionValue = frame.revision;
+    }
     if (this.currentState === "ended" && !(this.detachPending && frame.type === "attached")) {
       return;
     }
@@ -359,14 +389,9 @@ export class ShellSocket {
       case "canonical-size":
         this.handleCanonicalSize(frame);
         return;
-      case "lease-revoked":
-        this.teardownSocket();
-        this.clearAllTimers();
-        this.opts.events.onLeaseRevoked?.();
-        this.setState("ended");
-        return;
-      case "presentation-reset":
-        this.opts.events.onPresentationReset?.();
+      case "snapshot":
+        if (this.currentState !== "attached") return;
+        this.handleSnapshot(frame);
         return;
       case "exit":
         if (this.currentState !== "attached") return;
@@ -375,8 +400,12 @@ export class ShellSocket {
       case "pong":
         return;
       case "replay-evicted":
+      case "replay-gap":
         if (this.currentState !== "attached") return;
         this.opts.events.onGap();
+        return;
+      case "replay-start":
+      case "replay-end":
         return;
       case "error":
         this.handleErrorFrame(frame);
@@ -388,34 +417,30 @@ export class ShellSocket {
 
   private handleAttached(frame: Record<string, unknown>): void {
     this.clearAttachHandshakeTimer();
-    if (typeof frame.session === "string" && frame.session.length > 0) {
-      this.attachedSessionName = frame.session;
-    }
+    const ref = frame.terminalRef as Record<string, unknown> | undefined;
+    if (ref?.workspaceId !== this.terminalRef.workspaceId || ref?.tabId !== this.terminalRef.tabId) return;
+    this.attachedSessionName = this.opts.sessionName ?? null;
     if (this.detachPending) {
       this.sendDetachFrame();
       this.endSession();
       return;
     }
     this.failedAttempts = 0;
-    const lease = frame.lease;
-    const leaseEpoch = lease && typeof lease === "object"
-      ? (lease as Record<string, unknown>).epoch
-      : null;
-    this.leaseEpoch = typeof leaseEpoch === "number" && Number.isInteger(leaseEpoch) && leaseEpoch > 0
-      ? leaseEpoch
-      : null;
-    this.scheduleLeaseHeartbeat();
     this.handleCanonicalSize(frame.canonicalSize && typeof frame.canonicalSize === "object"
       ? frame.canonicalSize as Record<string, unknown>
       : {});
     this.flushPendingInput();
     this.scheduleAttachTimers();
+    this.scheduleHeartbeat();
     this.setState("attached");
   }
 
   private handleCanonicalSize(frame: Record<string, unknown>): void {
-    const cols = frame.cols;
-    const rows = frame.rows;
+    const size = frame.canonicalSize && typeof frame.canonicalSize === "object"
+      ? frame.canonicalSize as Record<string, unknown>
+      : frame;
+    const cols = size.cols;
+    const rows = size.rows;
     if (typeof cols !== "number" || typeof rows !== "number" || !Number.isInteger(cols) || !Number.isInteger(rows) || cols < MIN_COLS || cols > MAX_COLS || rows < MIN_ROWS || rows > MAX_ROWS) {
       return;
     }
@@ -432,19 +457,97 @@ export class ShellSocket {
     }
     this.lastSeqValue = seq;
     this.receivedOutput = true;
+    this.retainOutput(seq, data);
     this.opts.events.onOutput(data, seq);
+  }
+
+  private handleSnapshot(frame: Record<string, unknown>): void {
+    const seq = frame.seq;
+    const ansi = frame.ansi;
+    if (typeof seq !== "number" || !Number.isFinite(seq) || typeof ansi !== "string") return;
+    const presentationRevision = typeof frame.presentationRevision === "number"
+      ? frame.presentationRevision
+      : 0;
+    const replacesPresentation = presentationRevision > this.lastPresentationRevisionValue;
+    const needsReplayRecovery = replacesPresentation && this.receivedOutput && seq < this.lastSeqValue;
+    if (this.receivedOutput && seq <= this.lastSeqValue && !replacesPresentation) return;
+    const previousLastSeq = this.lastSeqValue;
+    const replay = needsReplayRecovery && previousLastSeq !== LIVE_TAIL_FROM_SEQ
+      ? this.retainedReplay(seq, previousLastSeq)
+      : [];
+    if (needsReplayRecovery && replay === null) {
+      // The existing presentation is complete through previousLastSeq, while
+      // the bounded local replay no longer covers every frame after this
+      // replacement snapshot. Preserve that complete presentation and the
+      // live attachment until a newer checkpoint catches up.
+      console.warn("[shell-socket] ignoring replacement snapshot outside retained output window");
+      return;
+    }
+    this.lastSeqValue = seq;
+    this.lastPresentationRevisionValue = Math.max(
+      this.lastPresentationRevisionValue,
+      presentationRevision,
+    );
+    this.receivedOutput = true;
+    this.opts.events.onGap();
+    this.opts.events.onOutput(ansi, seq);
+    this.discardRetainedOutputThrough(seq);
+    for (const output of replay ?? []) {
+      this.lastSeqValue = output.seq;
+      this.opts.events.onOutput(output.data, output.seq);
+    }
+  }
+
+  private retainOutput(seq: number, data: string): void {
+    if (!Number.isSafeInteger(seq) || seq === LIVE_TAIL_FROM_SEQ) return;
+    const prior = this.retainedOutput.findIndex((output) => output.seq === seq);
+    if (prior !== -1) {
+      this.retainedOutputChars -= this.retainedOutput[prior]!.data.length;
+      this.retainedOutput.splice(prior, 1);
+    }
+    this.retainedOutput.push({ seq, data });
+    this.retainedOutputChars += data.length;
+    while (
+      this.retainedOutput.length > REPLACEMENT_REPLAY_MAX_FRAMES
+      || this.retainedOutputChars > REPLACEMENT_REPLAY_MAX_CHARS
+    ) {
+      const removed = this.retainedOutput.shift();
+      if (!removed) break;
+      this.retainedOutputChars -= removed.data.length;
+    }
+  }
+
+  private retainedReplay(afterSeq: number, throughSeq: number): RetainedOutput[] | null {
+    const replay = this.retainedOutput
+      .filter((output) => output.seq > afterSeq && output.seq <= throughSeq)
+      .sort((left, right) => left.seq - right.seq);
+    let expectedSeq = afterSeq + 1;
+    for (const output of replay) {
+      if (output.seq !== expectedSeq) return null;
+      expectedSeq += 1;
+    }
+    return expectedSeq === throughSeq + 1 ? replay : null;
+  }
+
+  private discardRetainedOutputThrough(seq: number): void {
+    for (let index = this.retainedOutput.length - 1; index >= 0; index -= 1) {
+      const output = this.retainedOutput[index]!;
+      if (output.seq > seq) continue;
+      this.retainedOutputChars -= output.data.length;
+      this.retainedOutput.splice(index, 1);
+    }
   }
 
   private handleExit(frame: Record<string, unknown>): void {
     if (this.currentState !== "attached") return;
-    const code = frame.code;
-    if (typeof code !== "number" || !Number.isFinite(code)) {
+    const code = frame.exitCode;
+    if (code !== null && (typeof code !== "number" || !Number.isFinite(code))) {
       console.warn("[shell-socket] ignoring invalid exit frame");
       return;
     }
     this.teardownSocket();
     this.clearAllTimers();
-    this.opts.events.onExit(code);
+    this.opts.events.onExit(code ?? 0);
     this.setState("ended");
   }
 
@@ -475,18 +578,6 @@ export class ShellSocket {
     }, RESIZE_FALLBACK_AFTER_ATTACH_MS);
   }
 
-  private scheduleLeaseHeartbeat(): void {
-    if (this.leaseHeartbeatTimer !== null) this.clearT(this.leaseHeartbeatTimer);
-    this.leaseHeartbeatTimer = null;
-    if (this.leaseEpoch === null || this.currentState === "ended" || this.currentState === "fatal") return;
-    this.leaseHeartbeatTimer = this.setT(() => {
-      this.leaseHeartbeatTimer = null;
-      if (this.leaseEpoch === null || this.currentState !== "attached" || this.socket === null) return;
-      this.sendFrame({ type: "ping" });
-      this.scheduleLeaseHeartbeat();
-    }, LEASE_HEARTBEAT_INTERVAL_MS);
-  }
-
   private flushResize(): void {
     if (this.disposed || this.currentState !== "attached" || this.socket === null) return;
     const dims = this.lastKnownDims;
@@ -494,7 +585,7 @@ export class ShellSocket {
     if (this.lastSentDims !== null && this.lastSentDims.cols === dims.cols && this.lastSentDims.rows === dims.rows) {
       return;
     }
-    this.sendFrame({ type: "resize", cols: dims.cols, rows: dims.rows });
+    this.sendFrame({ type: "resize", terminalRef: this.terminalRef, mode: "soft", size: dims });
     this.lastSentDims = dims;
     this.resizeSentSinceAttach = true;
   }
@@ -504,8 +595,18 @@ export class ShellSocket {
     const chunks = this.pendingInput;
     this.pendingInput = [];
     for (const chunk of chunks) {
-      this.sendFrame({ type: "input", data: chunk });
+      this.sendFrame({ type: "input", terminalRef: this.terminalRef, data: chunk });
     }
+  }
+
+  private scheduleHeartbeat(): void {
+    if (this.heartbeatTimer !== null) this.clearT(this.heartbeatTimer);
+    this.heartbeatTimer = this.setT(() => {
+      this.heartbeatTimer = null;
+      if (this.disposed || this.currentState !== "attached") return;
+      this.sendFrame({ type: "ping", terminalRef: this.terminalRef });
+      this.scheduleHeartbeat();
+    }, HEARTBEAT_INTERVAL_MS);
   }
 
   private sendFrame(frame: Record<string, unknown>): void {
@@ -518,7 +619,7 @@ export class ShellSocket {
   }
 
   private sendDetachFrame(): void {
-    this.sendFrame({ type: "detach" });
+    this.sendFrame({ type: "detach", terminalRef: this.terminalRef });
     this.detachPending = false;
   }
 
@@ -561,7 +662,7 @@ export class ShellSocket {
       "settleTimer",
       "fallbackTimer",
       "handshakeTimer",
-      "leaseHeartbeatTimer",
+      "heartbeatTimer",
     ] as const) {
       const handle = this[key];
       if (handle !== null) {
@@ -569,7 +670,6 @@ export class ShellSocket {
         this[key] = null;
       }
     }
-    this.leaseEpoch = null;
   }
 
   private setState(state: ShellSocketState, detail?: { code?: string }): void {
