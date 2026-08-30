@@ -1,5 +1,6 @@
 import {
   TerminalRefSchema,
+  TerminalTabIdSchema,
   TerminalWorkspaceIdSchema,
   type TerminalRef,
   type TerminalTab,
@@ -134,6 +135,7 @@ export class TerminalRuntime {
   }
 
   async createTab(workspaceIdInput: string, input: {
+    tabId?: string;
     name: string;
     cwd: string;
     command?: string[];
@@ -141,23 +143,32 @@ export class TerminalRuntime {
     git?: TerminalTab["git"];
   }): Promise<TerminalTab> {
     const workspaceId = TerminalWorkspaceIdSchema.parse(workspaceIdInput);
+    const requestedTabId = input.tabId ? TerminalTabIdSchema.parse(input.tabId) : undefined;
     return this.runWorkspaceMutation(async () => {
+      const existing = requestedTabId
+        ? await this.store.getTab({ workspaceId, tabId: requestedTabId })
+        : undefined;
+      if (existing && existing.status !== "starting") return existing;
       const releaseObserverReservation = this.reserveObserverSlot(workspaceId);
-      let stagedTab: TerminalTab | undefined;
+      let stagedTab: TerminalTab | undefined = existing;
       let runtimeIds: { tabId: number; paneId: string } | undefined;
       let sessionName: string | undefined;
       try {
         const runtimeWorkspace = await this.requireRuntimeWorkspace(workspaceId);
         sessionName = runtimeWorkspace.zellijSessionName;
         await this.zellij.ensureSession(runtimeWorkspace.zellijSessionName, runtimeWorkspace.canonicalSize);
-        stagedTab = await this.store.createTab(workspaceId, input);
+        stagedTab ??= await this.store.createTab(workspaceId, input);
         const stagedWorkspace = await this.requireRuntimeWorkspace(workspaceId);
         const internalTab = stagedWorkspace.tabs[stagedTab.id];
         if (!internalTab) throw new Error("Terminal tab staging failed");
-        runtimeIds = await this.zellij.createTab(stagedWorkspace.zellijSessionName, {
+        const startupCommand = internalTab.startupCommand ?? input.command;
+        runtimeIds = existing
+          ? await this.zellij.findTabByInternalName?.(stagedWorkspace.zellijSessionName, internalTab.zellijTabName)
+          : undefined;
+        runtimeIds ??= await this.zellij.createTab(stagedWorkspace.zellijSessionName, {
           internalName: internalTab.zellijTabName,
           cwd: internalTab.cwd,
-          ...(input.command ? { command: input.command } : {}),
+          ...(startupCommand?.length ? { command: startupCommand } : {}),
         });
         const tab = await this.store.activateTab({ workspaceId, tabId: stagedTab.id }, runtimeIds);
         await this.restartObserver(workspaceId);
@@ -194,18 +205,26 @@ export class TerminalRuntime {
   private async reconcileWorkspaceNow(workspaceId: string): Promise<void> {
     const workspace = await this.requireRuntimeWorkspace(workspaceId);
     const needsObserver = Object.values(workspace.tabs)
-      .some((tab) => tab.status !== "exited" && tab.status !== "failed");
+      .some((tab) => (
+        tab.status === "starting"
+          ? tab.startupCommand !== undefined
+          : tab.status !== "exited" && tab.status !== "failed"
+      ));
     const releaseObserverReservation = needsObserver
       ? this.reserveObserverSlot(workspaceId)
       : () => undefined;
     try {
       await this.zellij.ensureSession(workspace.zellijSessionName, workspace.canonicalSize);
       for (const tab of Object.values(workspace.tabs).sort((left, right) => left.order - right.order)) {
-        if (tab.status === "exited" || tab.status === "failed") continue;
+        // Legacy starting records predate persisted startup intent. Leave only
+        // those pending so an idempotent client retry can supply the command.
+        if ((tab.status === "starting" && tab.startupCommand === undefined)
+          || tab.status === "exited" || tab.status === "failed") continue;
         let ids = await this.zellij.findTabByInternalName?.(workspace.zellijSessionName, tab.zellijTabName);
         ids ??= await this.zellij.createTab(workspace.zellijSessionName, {
           internalName: tab.zellijTabName,
           cwd: tab.cwd,
+          ...(tab.startupCommand?.length ? { command: tab.startupCommand } : {}),
         });
         await this.store.activateTab({ workspaceId, tabId: tab.id }, ids);
       }

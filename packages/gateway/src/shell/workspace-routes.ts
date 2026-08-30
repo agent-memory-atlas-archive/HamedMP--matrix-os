@@ -25,6 +25,7 @@ const TERMINAL_PASTE_ASSET_JSON_LIMIT = TERMINAL_PASTE_ASSET_BASE64_LIMIT + 1024
 
 const EnsureWorkspaceSchema = z.object({ projectId: ProjectIdSchema.optional() }).strict();
 const CreateTabSchema = z.object({
+  tabId: TerminalTabIdSchema.optional(),
   name: SafeDisplayStringSchema,
   cwd: z.string().max(4096),
   command: z.array(z.string().min(1).max(4096)).min(1).max(128).optional(),
@@ -61,6 +62,7 @@ export interface TerminalWorkspaceRouteRuntime {
   listWorkspaces(): Promise<TerminalWorkspace[]>;
   ensureWorkspace(input?: { projectId?: string }): Promise<TerminalWorkspace>;
   createTab(workspaceId: string, input: {
+    tabId?: string;
     name: string;
     cwd: string;
     command?: string[];
@@ -135,6 +137,7 @@ export function createTerminalWorkspaceRoutes(options: {
         ? await options.chatTerminals.prepare(principal, body.chatId)
         : null;
       const tab = await options.runtime.createTab(workspaceId, {
+        ...(body.tabId ? { tabId: body.tabId } : {}),
         name: body.name,
         cwd: binding?.cwd ?? body.cwd,
         ...(body.command ? { command: body.command } : {}),

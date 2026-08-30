@@ -22,11 +22,15 @@ import {
 
 const MAX_STATE_BYTES = 16 * 1024 * 1024;
 const DEFAULT_SIZE = { cols: 120, rows: 36 } as const;
+const StartupCommandSchema = z.array(z.string().min(1).max(4096)).max(128);
 const InternalTabSchema = TerminalTabSchema.omit({}).extend({
   zellijTabName: z.string().regex(/^matrix-tab-[0-9a-f]{32}$/),
   zellijTabId: z.number().int().min(0).nullable(),
   zellijPaneId: z.string().regex(/^terminal_[0-9]+$/).nullable(),
   migrationKey: z.string().min(1).max(256).optional(),
+  // Present, including an empty array for a plain shell, until activation.
+  // Optional only so state written before startup-intent persistence remains readable.
+  startupCommand: StartupCommandSchema.optional(),
 }).strict();
 const InternalWorkspaceBaseSchema = z.object({
   id: TerminalWorkspaceIdSchema,
@@ -132,18 +136,24 @@ export class TerminalWorkspaceStore {
   }
 
   async createTab(workspaceIdInput: string, input: {
+    tabId?: string;
     name: string;
     cwd: string;
+    command?: string[];
     agent?: TerminalTab["agent"];
     git?: TerminalTab["git"];
   }): Promise<TerminalTab> {
     const targetWorkspaceId = TerminalWorkspaceIdSchema.parse(workspaceIdInput);
+    const requestedTabId = input.tabId ? TerminalTabIdSchema.parse(input.tabId) : undefined;
     const name = SafeDisplayStringSchema.parse(input.name);
+    const startupCommand = input.command === undefined ? [] : StartupCommandSchema.min(1).parse(input.command);
     const now = this.now().toISOString();
     return this.mutate((state) => {
       const workspace = state.workspaces[targetWorkspaceId];
       if (!workspace) throw new Error("Terminal workspace not found");
-      const id = tabId();
+      const id = requestedTabId ?? tabId();
+      const existing = workspace.tabs[id];
+      if (existing) return this.toPublicTab(existing);
       const tab = InternalTabSchema.parse({
         id,
         workspaceId: targetWorkspaceId,
@@ -159,6 +169,7 @@ export class TerminalWorkspaceStore {
         zellijTabName: zellijTabName(),
         zellijTabId: null,
         zellijPaneId: null,
+        startupCommand,
       });
       workspace.tabs[id] = tab;
       workspace.revision += 1;
@@ -242,6 +253,7 @@ export class TerminalWorkspaceStore {
       if (!workspace || !tab) throw new Error("Terminal tab not found");
       tab.zellijTabId = zellijTabId;
       tab.zellijPaneId = zellijPaneId;
+      delete tab.startupCommand;
       tab.status = "running";
       tab.revision += 1;
       tab.updatedAt = now;
@@ -561,6 +573,7 @@ export class TerminalWorkspaceStore {
       zellijTabId: _tabId,
       zellijPaneId: _paneId,
       migrationKey: _migrationKey,
+      startupCommand: _startupCommand,
       ...publicTab
     } = tab;
     return TerminalTabSchema.parse(publicTab);

@@ -28,6 +28,7 @@ class FakeZellij implements ZellijRuntimeAdapter {
   readonly deletedSessions: string[] = [];
   readonly renamedTabs: Array<{ tabId: number; name: string }> = [];
   readonly resizedSessions: Array<{ cols: number; rows: number }> = [];
+  readonly createdTabCommands: Array<string[] | undefined> = [];
   failNextSubscription = false;
   failNextObserverClose = false;
   failNextCloseTab = false;
@@ -44,12 +45,17 @@ class FakeZellij implements ZellijRuntimeAdapter {
     if (!this.sessions.has(sessionName)) this.sessions.set(sessionName, new Map());
   }
 
-  async createTab(sessionName: string, input: { internalName: string }): Promise<{ tabId: number; paneId: string }> {
+  async createTab(sessionName: string, input: {
+    internalName: string;
+    cwd: string;
+    command?: string[];
+  }): Promise<{ tabId: number; paneId: string }> {
     const tabs = this.sessions.get(sessionName);
     if (!tabs) throw new Error("missing session");
     const tabId = this.nextTabId++;
     const paneId = `terminal_${tabId}`;
     tabs.set(tabId, { name: input.internalName, paneId });
+    this.createdTabCommands.push(input.command);
     this.nextTabCreated?.();
     this.nextTabCreated = undefined;
     return { tabId, paneId };
@@ -165,6 +171,113 @@ class FakeZellij implements ZellijRuntimeAdapter {
 }
 
 describe("project-scoped terminal runtime", () => {
+  it("returns the existing tab when a client retries the same tab id", async () => {
+    const homePath = await mkdtemp(join(tmpdir(), "matrix-terminal-runtime-"));
+    homes.push(homePath);
+    const zellij = new FakeZellij();
+    const runtime = new TerminalRuntime({ store: new TerminalWorkspaceStore({ homePath }), zellij });
+    const workspace = await runtime.ensureWorkspace({ projectId: "matrix-os" });
+    const requestedTabId = "tt_aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+
+    const first = await runtime.createTab(workspace.id, {
+      tabId: requestedTabId,
+      name: "Claude login",
+      cwd: "projects/matrix-os",
+      command: ["sh", "-lc", "claude"],
+    });
+    const retry = await runtime.createTab(workspace.id, {
+      tabId: requestedTabId,
+      name: "Claude login",
+      cwd: "projects/matrix-os",
+      command: ["sh", "-lc", "claude"],
+    });
+
+    expect(first.id).toBe(requestedTabId);
+    expect(retry).toEqual(first);
+    expect([...zellij.sessions.values()][0]?.size).toBe(1);
+  });
+
+  it("resumes a residual starting tab when a client retries the same tab id", async () => {
+    const homePath = await mkdtemp(join(tmpdir(), "matrix-terminal-runtime-"));
+    homes.push(homePath);
+    const store = new TerminalWorkspaceStore({ homePath });
+    const workspace = await store.ensureWorkspace({ projectId: "matrix-os" });
+    const requestedTabId = "tt_bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
+    await store.createTab(workspace.id, {
+      tabId: requestedTabId,
+      name: "Claude login",
+      cwd: "projects/matrix-os",
+      command: ["sh", "-lc", "claude"],
+    });
+    const zellij = new FakeZellij();
+    const runtime = new TerminalRuntime({ store, zellij });
+
+    const retry = await runtime.createTab(workspace.id, {
+      tabId: requestedTabId,
+      name: "Claude login",
+      cwd: "projects/matrix-os",
+      command: ["sh", "-lc", "claude"],
+    });
+
+    expect(retry).toMatchObject({ id: requestedTabId, status: "running" });
+    expect([...zellij.sessions.values()][0]?.size).toBe(1);
+  });
+
+  it("restores a persisted startup command across restart before a stable-id retry", async () => {
+    const homePath = await mkdtemp(join(tmpdir(), "matrix-terminal-runtime-"));
+    homes.push(homePath);
+    const store = new TerminalWorkspaceStore({ homePath });
+    const workspace = await store.ensureWorkspace({ projectId: "matrix-os" });
+    const requestedTabId = "tt_cccccccccccccccccccccccccccccccc";
+    await store.createTab(workspace.id, {
+      tabId: requestedTabId,
+      name: "Claude login",
+      cwd: "projects/matrix-os",
+      command: ["sh", "-lc", "claude"],
+    });
+    const zellij = new FakeZellij();
+    const runtime = new TerminalRuntime({ store, zellij });
+
+    await runtime.restoreAll();
+    expect([...zellij.sessions.values()][0]?.size).toBe(1);
+    expect(zellij.createdTabCommands).toEqual([["sh", "-lc", "claude"]]);
+
+    const retry = await runtime.createTab(workspace.id, {
+      tabId: requestedTabId,
+      name: "Claude login",
+      cwd: "projects/matrix-os",
+      command: ["sh", "-lc", "claude"],
+    });
+
+    expect(retry).toMatchObject({ id: requestedTabId, status: "running" });
+    expect(zellij.createdTabCommands).toEqual([["sh", "-lc", "claude"]]);
+    await runtime.shutdown();
+  });
+
+  it("restores a generated-id launch command without requiring a client retry", async () => {
+    const homePath = await mkdtemp(join(tmpdir(), "matrix-terminal-runtime-"));
+    homes.push(homePath);
+    const store = new TerminalWorkspaceStore({ homePath });
+    const workspace = await store.ensureWorkspace({ projectId: "matrix-os" });
+    const staged = await store.createTab(workspace.id, {
+      name: "Install Hermes",
+      cwd: "projects/matrix-os",
+      command: ["matrix-agent-runtime-control", "install", "hermes"],
+    });
+    const zellij = new FakeZellij();
+    const runtime = new TerminalRuntime({ store, zellij });
+
+    await runtime.restoreAll();
+
+    expect((await runtime.listWorkspaces())[0]?.tabs).toContainEqual(
+      expect.objectContaining({ id: staged.id, status: "running" }),
+    );
+    expect(zellij.createdTabCommands).toEqual([
+      ["matrix-agent-runtime-control", "install", "hermes"],
+    ]);
+    await runtime.shutdown();
+  });
+
   it("runs twenty-three tabs in exactly one Zellij server for their project", async () => {
     const homePath = await mkdtemp(join(tmpdir(), "matrix-terminal-runtime-"));
     homes.push(homePath);

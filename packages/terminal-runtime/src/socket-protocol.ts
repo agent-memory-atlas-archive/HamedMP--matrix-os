@@ -2,6 +2,7 @@ import {
   ProjectIdSchema,
   SafeDisplayStringSchema,
   TerminalRefSchema,
+  TerminalTabIdSchema,
   TerminalWorkspaceIdSchema,
 } from "@matrix-os/contracts";
 import { z } from "zod/v4";
@@ -21,6 +22,7 @@ export const TerminalRuntimeRequestSchema = z.discriminatedUnion("operation", [
     operation: z.literal("CreateTab"),
     input: z.object({
       workspaceId: TerminalWorkspaceIdSchema,
+      tabId: TerminalTabIdSchema.optional(),
       name: SafeDisplayStringSchema,
       cwd: z.string().max(4096),
       command: z.array(z.string().min(1).max(4096)).min(1).max(128).optional(),
